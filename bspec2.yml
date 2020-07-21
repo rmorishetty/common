@@ -1,0 +1,32 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.8
+  pre_build:
+    commands:
+      - echo "getting proyect modules code"
+      - git clone url
+      - cd de_terraform
+      - git checkout only_modules_edw_ga_removed
+      - cd ..
+      - echo "getting proyect main code"
+      - git clone url
+      - cd xxx
+      - git checkout terraform
+      - echo "installing terraform"
+      - wget https://releases.hashicorp.com/terraform/0.11.8/terraform_0.11.8_linux_amd64.zip
+      - unzip terraform_0.11.8_linux_amd64.zip
+      - mv terraform /usr/local/bin/
+      - terraform --version
+  build:
+    commands:
+      - SRC=`pwd`
+      - echo "starting deploy"
+      - cd deploy/terraform/dev/tables/
+      - terraform init && terraform apply -auto-approve && cd $SRC
+  post_build:
+    commands:
+      - echo "about to copy code here --> s3://$BUCKET_NAME/app/google_analytics/"
+      - aws s3 sync . s3://$BUCKET_NAME/ --delete --exclude='.git/*' --exclude='*.terraform/*'
