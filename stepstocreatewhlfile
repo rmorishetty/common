@@ -1,0 +1,594 @@
+python setup.py sdist bdist_wheel
+
+here is a repo that i cloned from here: https://github.com/ryanmiville/zeppelin-glue
+GitHubGitHub
+ryanmiville/zeppelin-glue
+docker-compose project for easier local AWS Glue development - ryanmiville/zeppelin-glue
+12:58
+it will allow you to quickly spin up / spin down development endpoints, should that be useful to you.
+https://git.infra.aucn.io/users/jstephens/repos/zeppelin-glue/browse
+
+1:00
+this has a local notebook running in docker, which is all you probably need most of the time. if you need a notebook server too, you’d have to figure that out
+
+import os, requests, json, time
+import datetime, re
+
+class Client(object):
+
+    def __init__(self, auth_url='https://login.salesforce.com/services/oauth2/token', test=False):
+        if test:
+            auth_url='https://test.salesforce.com/services/oauth2/token'
+        auth = self.__api_authenticate(auth_url)
+        self.__access_token = auth.get('access_token')
+        self.__instance_url = auth.get('instance_url')
+    
+    def __api_authenticate(self, authentication_url):
+        """
+        Helper function to authenticate Salesforce REST API call
+        Parameters: authentication URL.
+        Return: Instance URL, Access Token. 
+        """
+        credential = json.load(open(os.environ['SFDC_REST_API_CREDENTIAL']))
+        r = requests.post(authentication_url, params=credential)
+        return r.json()
+
+    def __get_error_code(self, e):
+        pattern=re.compile(r'"errorCode":"(\w+)"')
+        return pattern.search(e.args[0]).group(1)
+
+    def api_call(self, action, parameters = {}, method = 'get', data = {}):
+        """
+        Helper function to make calls to Salesforce REST API.
+        Parameters: action (the URL), URL params, method (get, post or patch), data for POST/PATCH.
+        """
+
+        headers = {
+            'Content-type': 'application/json',
+            'Accept-Encoding': 'gzip',
+            'Authorization': 'Bearer %s' % self.__access_token
+        }
+
+        if method == 'get':
+            r = requests.request(method, self.__instance_url+action, headers=headers, params=parameters, timeout=600)
+        elif method in ['post', 'patch']:
+            r = requests.request(method, self.__instance_url+action, headers=headers, params=parameters, json=data, timeout=30)
+        else:
+            # other methods not implemented in this example
+            raise ValueError('Method should be get or post or patch.')
+        print('Debug: API %s call: %s' % (method, r.url) )
+        if r.status_code < 300:
+            if method=='patch':
+                return None
+            else:
+                return r.json()
+        else:
+            raise Exception('API error when calling %s : %s' % (r.url, r.content))
+    
+    def get_updated_ids(self, object_name, start_time, end_time):
+        params = {
+            'start' : start_time,
+            'end' : end_time
+        }
+        action = '/services/data/v47.0/sobjects/%s/updated/' % object_name
+        try:
+            results=self.api_call(action, params)
+        except Exception as e:
+            if self.__get_error_code(e)=='EXCEEDED_ID_LIMIT':
+                a=datetime.datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S+00:00')
+                b=datetime.datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S+00:00')
+                start_time_1 = start_time
+                end_time_1 = (a+(b-a)/2).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+                start_time_2 = end_time_1
+                end_time_2 = end_time
+                return self.get_updated_ids(object_name, start_time_1, end_time_1) + \
+                self.get_updated_ids(object_name, start_time_2, end_time_2)
+            else:
+                raise e
+        return results.get('ids')
+
+    def get_deleted_ids(self, object_name, start_time, end_time):
+        params = {
+            'start' : start_time,
+            'end' : end_time
+        }
+        action = '/services/data/v47.0/sobjects/%s/deleted/' % object_name
+        results=self.api_call(action, params)
+        return [x.get('id') for x in results.get('deletedRecords')]
+
+    def get_record_by_id(self, object_name, id_str=''):
+        action = '/services/data/v47.0/sobjects/%s/%s/' % (object_name, id_str)
+        return self.api_call(action)
+
+    def get_records_by_ids(self, object_name, fields=[], ids=[], filename=''):
+        all_fields = set([x.lower() for x in self.get_all_fields(object_name)])
+        available_fields = []
+        missing_fields = []
+        for field in fields:
+            if field in all_fields:
+                available_fields.append(field)
+                all_fields.remove(field)
+            else:
+                missing_fields.append(field)
+        more_fields = list(all_fields)
+        params = {
+            'fields' : available_fields
+        }
+        records = []
+        for x in ids:
+            action = '/services/data/v47.0/sobjects/%s/%s/' % (object_name, x)
+            records.append(self.api_call(action, parameters=params))
+        with open(filename, 'w') as f:
+            for record in records:
+                f.write("%s\n" % json.dumps(record, separators=(',',':')))
+
+    def get_all_ids(self, object_name):
+        ids=[]
+        action = '/services/data/v47.0/query/' 
+        params = {
+            'q' : 'select Id from %s' % object_name
+        }
+        result = self.api_call(action, parameters=params)
+        ids.extend([record.get('Id') for record in result['records']])
+        while not result['done']:
+            action = result['nextRecordsUrl']
+            result = self.api_call(action)
+            ids.extend([record.get('Id') for record in result['records']])
+        return
+
+    def get_all_fields(self, object_name):
+        action='/services/data/v47.0/sobjects/%s/describe' % object_name
+        fields = [field.get('name') for field in self.api_call(action).get('fields')]
+        return fields 
+    
+    
+    def get_all_records(self, object_name, fields= [], filename='', multipart=False, condition=''):
+        all_fields = set([x.lower() for x in self.get_all_fields(object_name)])
+        available_fields = []
+        missing_fields = []
+        for field in fields:
+            if field in all_fields:
+                available_fields.append(field)
+                all_fields.remove(field)
+            else:
+                missing_fields.append(field)
+        more_fields = list(all_fields)
+        action = '/services/data/v47.0/query/'
+        params = {
+            'q' : 'select %s from %s %s' % (', '.join(available_fields), object_name, condition)
+        }
+        records = []
+        result = self.api_call(action, parameters=params)
+        records.extend(result.get('records'))
+        if not multipart:
+            while not result['done']:
+                action = result['nextRecordsUrl']
+                result = self.api_call(action)
+                records.extend(result.get('records'))
+            count = len(records)
+            with open(filename, 'w') as f:
+                for record in records:
+                    f.write("%s\n" % json.dumps(record, separators=(',',':')))
+        else:
+            count = 0
+            while not result['done']:
+                records = []
+                batch = 0
+                while batch<100:
+                    action = result['nextRecordsUrl']
+                    result = self.api_call(action)
+                    records.extend(result.get('records'))
+                    if result['done']:
+                        break
+                    batch+=1
+                with open(filename, 'a') as f:
+                    for record in records:
+                        f.write("%s\n" % json.dumps(record, separators=(',',':')))
+                    count+=len(records)
+        
+        result = {
+                    'name':object_name, 
+                    'records_count':count, 
+                    'missing_fields':missing_fields, 
+                    'more_fields':more_fields, 
+                    'finished_time':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+        return result
+
+
+up--r
+import sys, os
+import re
+import boto3
+from datetime import date, timedelta
+import json
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from pyspark import SparkConf
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame, DynamicFrameWriter
+import sfdc_rest_api
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+
+
+# s3 locations and runing schedule relelated text
+CURRENT_DIR = 'data/raw/sfdc'
+
+
+
+if __name__ == '__main__':
+
+    # Initiate spark session, set up api client
+    args = getResolvedOptions(sys.argv, ['object_name',
+                                        'standard_object_name', 
+                                        'updated_id_path', 
+                                        'deleted_id_path',
+                                        'updates_file',
+                                        'credential_name',
+					'BUCKET'])
+    BUCKET = args['BUCKET']
+    standard_object_name = args['standard_object_name']
+    conf = (SparkConf().set("spark.driver.maxResultSize", "10g").set("spark.sql.autoBroadcastJoinThreshold", -1))
+    sc = SparkContext(appName='sfdc_update_raw_file [%s.json]' % standard_object_name, conf=conf)
+    glueContext = GlueContext(sc)
+    s3 = boto3.client('s3')
+    s3.download_file(BUCKET, 'app/sfdc/api/%s' % args['credential_name'], args['credential_name'])
+    os.environ['SFDC_REST_API_CREDENTIAL'] = args['credential_name']
+    sfdc = sfdc_rest_api.Client()
+    
+    
+    # Download ids for records that need to be deleted or updated
+    s3.download_file(BUCKET, args['deleted_id_path'], 'deleted_id.json')
+    s3.download_file(BUCKET, args['updated_id_path'], 'updated_id.json')
+    # Download fields info
+    s3.download_file(BUCKET, 'app/sfdc/object_fields/%s_fields.json' % standard_object_name, 
+                            '%s_fields.json' % standard_object_name)
+    
+    with open('deleted_id.json', 'r') as f:
+        deletes_id = json.load(f)
+    with open('updated_id.json', 'r') as f:
+        updates_id = json.load(f)
+    with open('%s_fields.json' % standard_object_name, 'r') as f:
+        fields=json.load(f)
+    
+    if standard_object_name == "offer":
+        modified_id = updates_id
+        mode="upsert only"
+    else:
+        modified_id = deletes_id+updates_id
+        mode="upsert and delete"
+    
+    if len(modified_id)>0:
+        # Load source data, apply filtering
+        filtering_condition = "Id not in (%s)" % json.dumps(modified_id).strip('[]')
+        paths = []
+        prefix = CURRENT_DIR+'/'+standard_object_name+'/'
+        r = s3.list_objects(Bucket=BUCKET, Prefix=prefix)
+        contents = r.get('Contents')
+        for element in r.get('Contents'):
+            o = element.get('Key')
+            if len(o)>len(prefix):
+                paths.append('s3://%s/%s' % (BUCKET, o))
+        filtered_records = glueContext.create_dynamic_frame.from_options(connection_type='s3', 
+        connection_options={'paths': paths}, format='json').toDF().filter(filtering_condition)
+        
+        if mode=="upsert only":
+            filtered_records.withColumn("IsDeleted", F.when(F.col("Id") in deletes_id,F.lit("True")).otherwise("False"))
+        
+        # Download and Load updates data
+        updates_file = args['updates_file']
+        p=re.compile(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2})-(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{2}:\d{2})')
+        m=p.search(updates_file)
+        start_time, end_time = [m.group(1), m.group(2)]
+        end_time=end_time.split('.')[0]
+        condition = 'where systemmodstamp>=%s and systemmodstamp<=%s' % (start_time, end_time) 
+        sfdc.get_all_records(args['object_name'], fields=fields, filename='%s' % updates_file, condition=condition)
+        updates_path = 'app/sfdc/daily_updates/%s/%s/%s' % (standard_object_name, 
+                                                    'datestamp=%s' % date.today().strftime('%Y%m%d'), 
+                                                    updates_file)
+        s3.upload_file('%s' % updates_file, BUCKET, updates_path)
+        if len(updates_id)>0:
+            records_to_add = glueContext.create_dynamic_frame.from_options(connection_type='s3', 
+            connection_options = {'paths': ['s3://%s/%s' % 
+            (BUCKET, updates_path)]}, 
+            format='json').toDF()
+            
+            #union
+            dtypes1 = dict(filtered_records.dtypes)
+            dtypes2 = dict(records_to_add.dtypes)
+            
+            for key in dtypes2:
+                if key not in dtypes1:
+                    dtypes1[key]=dtypes2[key]
+                    filtered_records.withColumn(key, F.lit(None).cast(dtypes1[key]))
+            for key in dtypes1:
+                if key not in dtypes2:
+                    dtypes2[key]=dtypes1[key]
+                    records_to_add.withColumn(key, F.lit(None).cast(dtypes2[key]))
+            names = records_to_add.schema.names
+            def struct_to_array(struct):
+                if struct:
+                    return list(struct.asDict().values())
+                else:
+                    return None
+            names.remove('attributes')
+            for name in names:
+                if dtypes1[name]!=dtypes2[name]:
+                    print("Incompatible DataType Found")
+                    print(name)
+                    print(dtypes1[name])
+                    print(dtypes2[name])
+                    if dtypes1[name][:5]=='array' and dtypes2[name][:6]=='struct':
+                        print("Yes")
+                        p=re.compile(r'<(\w+)>')
+                        array_type = p.search(dtypes1[name]).group(1)
+                        print(array_type)
+                        type_map = {'string':T.StringType(), 'double': T.DoubleType()}
+                        udf_struct_to_array = F.udf(struct_to_array, T.ArrayType(type_map[array_type])) 
+                        records_to_add = records_to_add.withColumn(name, udf_struct_to_array(name))
+                        records_to_add.cache()
+                    else: 
+                        if dtypes2[name] != 'null':
+                            filtered_records = filtered_records.withColumn(name, F.col(name).cast(dtypes2[name]))
+                            filtered_records.cache()
+                        else:
+                            records_to_add = records_to_add.withColumn(name, F.col(name).cast(dtypes1[name]))
+                            records_to_add.cache()
+            print("All fields:")
+            print(names)
+            filtered_records = filtered_records.select(*names)
+            records_to_add = records_to_add.select(*names)
+            records = filtered_records.unionAll(records_to_add)
+            print("Schema After Join:")
+            print(records.schema.names)
+        else:
+            records = filtered_records.drop('attributes')
+                             
+        dyf_records = DynamicFrame.fromDF(records, glueContext, 'dyf_records')
+        # write to tmp folder
+        writer = DynamicFrameWriter(glueContext)
+        writer.from_options(frame = dyf_records, connection_type='s3', 
+        connection_options={'path': 's3://%s/%s/%s_tmp/' % (BUCKET, CURRENT_DIR, standard_object_name)}, format='json')
+        
+        # substitute current with tmp folder
+        r = s3.list_objects(Bucket=BUCKET, Prefix=prefix)
+        contents = r.get('Contents')
+        for element in r.get('Contents'):
+            o = element.get('Key')
+            if len(o)>len(prefix):
+                s3.delete_object(Bucket=BUCKET, Key=o)
+        prefix = CURRENT_DIR+'/'+standard_object_name+'_tmp/'
+        r = s3.list_objects(Bucket=BUCKET, Prefix=prefix)
+        contents = r.get('Contents')
+        for element in r.get('Contents'):
+            o = element.get('Key')
+            if len(o)>len(prefix):
+                copy_source = {
+                    'Bucket': BUCKET,
+                    'Key': o
+                }
+                s3.copy(copy_source, BUCKET, ''.join(o.split('_tmp')))
+                s3.delete_object(Bucket=BUCKET, Key=o)
+        
+        
+        import boto3
+import gzip
+import datetime
+from dateutil.tz import tzutc
+from awsglue.utils import getResolvedOptions
+import sys
+import re
+import subprocess
+from subprocess import Popen, PIPE
+import os
+
+args = getResolvedOptions(sys.argv,
+                          ['JOB_NAME',
+                           'bkt',
+                           ])
+
+mybucket = args['bkt']
+
+mymlhpath = 'data/prepare/'
+mymlhrawpath = 'data/raw/'
+mycontrol = 'mlhrcpREGISTRY/'
+MYDELIMITER = ''
+
+
+aalhtables = [
+
+]
+
+def getfirstdate(mybucket):
+    s3r = boto3.resource('s3')
+    cr_date = s3r.Bucket(mybucket).creation_date
+    print("printing the crdateofmybucket:", cr_date)
+    return s3r.Bucket(mybucket).creation_date
+
+
+FIRSTDATE = getfirstdate(mybucket)
+
+def getlastprocessedts(myprefix):
+    mylist = s3.list_objects(Bucket = mybucket, Prefix = myprefix)
+    if 'Contents' in mylist and len(mylist['Contents']) == 1:
+        return eval(s3.get_object(Bucket = mybucket, Key = myprefix)['Body'].read().decode('utf-8'))
+    else:
+        return FIRSTDATE
+
+def checkanyfilesfortable(myprefix):
+    mylist = s3.list_objects(Bucket = mybucket, Prefix = myprefix)
+    if 'Contents' in mylist :
+        return True
+    else:
+        return False
+
+def putlastprocessedtsOLD(myprefix,mytsTEMP):
+    mylist = s3.list_objects(Bucket = mybucket, Prefix = mytsTEMP)
+    if 'Contents' in mylist and len(mylist['Contents']) == 1:
+        s3.put_object(Bucket = mybucket, Key = myprefix, Body=mylist['Contents'][0]['LastModified'].strftime("datetime.datetime(%Y, %-m, %-d, %-H, %-M, %-S, tzinfo=tzutc())").encode('utf-8'))
+
+def putlastprocessedts(myprefix,myts):
+    s3.put_object(Bucket = mybucket, Key = myprefix, Body=myts.encode('utf-8'))
+ 
+def getconsolidatedfile(myprefix):
+    mylist = s3.list_objects(Bucket = mybucket, Prefix = myprefix)
+    if 'Contents' in mylist and len(mylist['Contents']) == 1:
+        return mylist['Contents'][0]['Key']
+    else:
+        return ''
+
+def getfilenames4table(ts, kwargs):
+    keys = []
+    for page in paginator.paginate(**kwargs):
+        try:
+            contents = page["Contents"]
+        except KeyError:
+            return []
+        for obj in contents:
+            if ts < obj["LastModified"]:
+                keys.append(obj["Key"])
+    return keys
+
+def getconsolfilecontents(myprefix):
+    consolfilecontents = gzip.decompress(
+                    s3.get_object(Bucket = mybucket, Key = myprefix)['Body'].read()).decode('utf-8')
+    mdict={}
+    for line in consolfilecontents.split('\n'):
+        myid = line[0:line.find(MYDELIMITER)]
+        if myid !='' and myid not in mdict:
+            mdict[myid] = line
+    return mdict
+
+def writeconsolfile2s3(myprefix, myrprefix, mycontent, incremental=False):
+    # compress content to gzip
+    compressed_content = gzip.compress(bytes(mycontent,'utf-8'))
+    # write to s3 compress content to gzip
+    s3.put_object(Bucket = mybucket, Key = myprefix, Body=compressed_content)
+    s3.put_object(Bucket = mybucket, Key = myrprefix, Body=compressed_content)
+    if incremental:
+        loc=myprefix.rfind('/',1)+1
+        #write to backup file
+        s3.put_object(Bucket = mybucket, 
+                        Key = f"{myprefix[0:loc]}{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{myprefix[loc:]}",
+                        Body=compressed_content)
+    return
+
+s3 = boto3.client('s3')
+paginator = s3.get_paginator("list_objects_v2")
+kwargs = {'Bucket': mybucket}
+
+#dbschema name to table name mapping
+dbsrcdlfldrmap = {"CookieDB":"cookiedb", "documents":"documents", "mylandho_landauctiontax":"landauctiontax", "Lookups":"lookups", "mylandho_foreclosure":"foreclosure", "reo1964_reoconnection":"reo", "mylandho_userInformation":"userinformation", "UserNotification":"usernotification"}
+#dbschema name to subject mapping
+dbsrcdlsubjmap = {"CookieDB":"mlh", "documents":"mlh", "mylandho_landauctiontax":"mlh", "Lookups":"mlh", "mylandho_foreclosure":"mlh", "reo1964_reoconnection":"rcp", "mylandho_userInformation":"mlh", "UserNotification":"mlh"}
+
+print(f"Started processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}  ")
+for mytable in mymlhtables:
+
+    dbsrc = mytable.split('/')[0]
+    dbtbl = mytable.split('/')[1].lower()
+    dbdlf = dbsrcdlfldrmap[dbsrc]
+    dbdls = dbsrcdlsubjmap[dbsrc]
+    myfirstime = False
+    tmyrtable = 'foreclosure/states'
+    mytablepath = f'{mymlhpath}{mytable}'
+    myctable = f'{mymlhpath}{mycontrol}{mytable}/consolidated.csv.gz'
+    myrtable = f'{mymlhrawpath}{dbdls}/{dbdlf}/{dbtbl}/consolidated.csv.gz'
+    myctableprocessedts = f'{mymlhpath}{mycontrol}{mytable}/timestampasof'
+
+    if not checkanyfilesfortable(mytablepath):
+        print(f'{mytablepath} does not exists in our prepare area')
+        continue
+    
+    print(f"{mytable} - started processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}  ",end="")
+
+    ts = getlastprocessedts(myctableprocessedts)
+
+    ## get previous image of consolidated file
+    myconsolidatedfile = getconsolidatedfile(myctable)
+    print(myconsolidatedfile)
+    mydict = {}
+    if not myconsolidatedfile:
+        ## generate initial LOAD files
+        myfirstime = True
+        kwargs["Prefix"] = f'{mymlhpath}{mytable}/LOAD'
+        myfiles2merge = getfilenames4table(ts, kwargs)
+	    #CSV below
+        mycontents = ''
+        mycontentsp = ''
+        for myfile in myfiles2merge:
+            mycontentsp += s3.get_object(Bucket = mybucket, Key = myfile)['Body'].read().decode('utf-8')
+        mycontentsp=str.encode(mycontentsp)
+        with open('/tmp/'+dbsrc+'_'+dbtbl, 'wb') as fprep:
+            fprep.write(mycontentsp)
+        with open('/tmp/'+dbsrc+'_'+dbtbl, 'rb') as frd:
+            mycontents=frd.read().replace(b'\x0d\x0a', b'')
+        with open('/tmp/'+dbsrc+'_'+dbtbl+'_prsd', 'wb') as fwt:
+            fwt.write(mycontents)
+        with open('/tmp/'+dbsrc+'_'+dbtbl+'_prsd', 'rb') as frp:
+            mycontentsd=frp.read()
+        mycontentsd_op = ''
+        awk_command=r"""awk '(NR-1)%2{$1=$1}1' RS=\" ORS=\" """
+        sed_command = """sed '$d' """
+        with open('/tmp/'+dbsrc+'_'+dbtbl+'_nl_prsd', 'wb') as fnwt:
+            ex = subprocess.Popen(awk_command, stdin = open('/tmp/'+dbsrc+'_'+dbtbl+'_prsd','rb'), stdout = subprocess.PIPE, stderr = subprocess.PIPE, shell=True)
+            ot,et = ex.communicate()
+            fnwt.write(ot)
+        with open('/tmp/'+dbsrc+'_'+dbtbl+'_nlll_prsd', 'wb') as flwt:
+            exs = subprocess.Popen(sed_command, stdin = open('/tmp/'+dbsrc+'_'+dbtbl+'_nl_prsd','rb'), stdout = subprocess.PIPE, stderr = subprocess.PIPE, shell=True)
+            ots,ets = exs.communicate()
+            flwt.write(ots)
+        with open('/tmp/'+dbsrc+'_'+dbtbl+'_nlll_prsd', 'rb') as fnl:
+            mycontentsd_op=fnl.read().decode('utf-8')
+
+        for line in mycontentsd_op.split('\n'):
+            myid = line[0:line.find(MYDELIMITER)]
+            if myid !='' and myid not in mydict:
+                mydict[myid] = line
+        writeconsolfile2s3(myctable,myrtable,mycontentsd_op)
+
+    ###get delta files and get the content    
+    kwargs["Prefix"] = f'{mymlhpath}{mytable}/'
+    myfiles2merge = [fname  for fname in getfilenames4table(ts, kwargs) if not fname.startswith(kwargs['Prefix']+'LOAD')] 
+    mytempmarker = datetime.datetime.now().strftime("datetime.datetime(%Y, %-m, %-d, %-H, %-M, %-S, tzinfo=tzutc())")
+    #remove placing tempmarker file in s3, instead save the time as commented and pass to putfile directly the content.
+
+    if myfiles2merge:
+        ## load the existing consolidated file in memory if only there is delta to process.
+        if myconsolidatedfile:
+            mydict = getconsolfilecontents(myconsolidatedfile)
+
+        #csv:
+        deltalines=''
+        for myfile in myfiles2merge:
+            deltalines += s3.get_object(Bucket = mybucket, Key = myfile)['Body'].read().decode('utf-8')
+
+        # traverse through all the delta lines and update main dictionary
+        for line in deltalines.split('\n'):
+            rowaction=line[0:line.find(MYDELIMITER)]
+            myid=line[line.find(MYDELIMITER)+1:line.find(MYDELIMITER,2)]
+            linerow=line[line.find(MYDELIMITER)+1:]
+            if rowaction == 'I':
+                mydict[myid] = linerow
+            elif rowaction == 'U':
+                mydict[myid] = linerow
+            elif rowaction == 'D':
+                delrow = mydict.pop(myid, None)
+
+        # convert dict values to csv lines
+        newconsolfilecontents = ''
+        for k in mydict.keys():
+            newconsolfilecontents += mydict[k]+'\n'
+        writeconsolfile2s3(myctable,myrtable,newconsolfilecontents,True)
+        putlastprocessedts(myctableprocessedts,mytempmarker)
+        print(f"{mytable} - Ended processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}")
+    else:
+        print(f' ** No delta changes to {mytable} ',end='')
+        print(f" {mytable} - Ended processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}")
+    
+ 
+print(f"Ended processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}  ")
+        
+
