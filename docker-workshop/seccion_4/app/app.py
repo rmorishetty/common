@@ -1,0 +1,1 @@
+print("PYTHON: Life IS good!")
