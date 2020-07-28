@@ -1,3 +1,12 @@
+Steps for docker
+--------------
+docker build . -t test
+docker run test
+docker-compose up
+
+
+------------
+
 python setup.py sdist bdist_wheel
 
 here is a repo that i cloned from here: https://github.com/ryanmiville/zeppelin-glue
@@ -590,5 +599,274 @@ for mytable in mymlhtables:
     
  
 print(f"Ended processing {datetime.datetime.utcnow().strftime('%Y%m%d %H:%M:%S.%f')}  ")
+
+
+Creating triggers in AWS Lambda is really easy from the console but we want to automate that process. In this post we'll create triggers programatically.:
+https://markhneedham.com/blog/2017/04/05/aws-lambda-programatically-scheduling-a-cloudwatchevent/
+
+
+hadoop distcp -Dfs.s3a.access.key=AKIAQJE5Q4NS3OOZRLUV -Dfs.s3a.secret.key=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 hdfs://xxx/ s3a://xxx
+
+Deploying Multiple Environments with Terraform
+
+
+https://medium.com/airwalk/using-the-aws-developer-tools-to-deploy-terraform-259e71486b5b
+https://medium.com/capital-one-tech/deploying-multiple-environments-with-terraform-kubernetes-7b7f389e622
+
+
+AWS Lambda with Pandas and NumPy
+https://medium.com/@korniichuk/lambda-with-pandas-fd81aa2ff25e
+
+
+How to trigger a Jenkins job remotely from Python script » Easy as Linux
+https://www.easyaslinux.com/tutorials/devops/how-to-trigger-a-jenkins-job-remotely-from-python-script/
+
+Simplify data pipelines with AWS Glue automatic code generation and Workflows | Amazon Web Services
+https://aws.amazon.com/blogs/big-data/simplify-data-pipelines-with-aws-glue-automatic-code-generation-and-workflows/
+
+"""
+    Module for preparing raw dataset
+"""
+import sys
+import boto3
+import time
+import pyspark.sql.functions as F
+from pyspark.sql import functions as F
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from datetime import datetime
+
+glueContext = GlueContext(SparkContext.getOrCreate())
+glue_client = boto3.client("glue", region_name="us-west-2")
+s3conn = boto3.client('s3')
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+from ade_utils import io_utils
+from pyspark.sql.functions import *
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.types import *
+from pyspark.sql import Row
+
+s3 = boto3.client('s3')
+ddbconn = boto3.client('dynamodb', region_name='us-west-2')
+
+
+def init_spark_session(APP_NAME, database, table_name):
+    spark = SparkSession.builder.appName(
+        "%s %s_%s_load" % \
+        (database, APP_NAME, table_name)) \
+        .enableHiveSupport() \
+        .getOrCreate()
+    spark.sparkContext.setLogLevel('WARN')
+    return spark
+
+
+def derive_order(col1):
+    if (col1 == 'L'):
+        return 0
+    elif (col1 == 'I'):
+        return 1
+    elif col1 == 'U':
+        return 2
+    else:
+        return 3
+
+
+def main():
+    params = io_utils.get_db_and_dir_details()
+    args = {}
+    args = getResolvedOptions(sys.argv,
+                              ['JOB_NAME',
+                               'app_name',
+                               'subject',
+                               'table_name',
+                               'primary_keys',
+                               'list_of_files',
+                               'job_max_cap'])
+
+    print("params")
+    print(params)
+    bucket_name = io_utils.get_bucket_name()
+    app_name = args['app_name']
+    table_name = args['table_name']
+    spark = init_spark_session(app_name, params['raw_database'], table_name)
+    list_of_files = args['list_of_files']
+    subject = args['subject']
+    data_path = '/data'
+    prepare_path = ''.join(["s3://", bucket_name, data_path, "/prepare/", subject, "/", table_name, "/"])
+    stage_path = ''.join(["s3://", bucket_name, data_path, "/stage/", subject, "/", table_name, "/"])
+    raw_path = ''.join(
+        ["s3://", bucket_name, data_path, "/raw/", app_name, "/", subject, "/", table_name, "/"])
+    prefix = ''.join([data_path, '/raw/', app_name, "/", subject, "/", table_name, "/"])
+    folders = s3conn.list_objects(Bucket=bucket_name, Prefix=prefix[1:])
+    initial_load = False
+    print(prefix)
+    if 'Contents' in folders:
+        print("Raw directory exists")
+        print(folders['Contents'])
+        if len(folders['Contents']) == 1:
+            initial_load = True
+    else:
+        print("Creating raw directory")
+        initial_load = True
+        response = s3conn.put_object(Bucket=bucket_name,
+                                     Body='',
+                                     Key=prefix[1:])
+        print(response)
+        folders = s3conn.list_objects(Bucket='adc-dev', Prefix=prefix[1:])
+        print(folders['Contents'])
+        print("Time Wait")
+        time.sleep(120)
+    try:
+        schema_df = spark.sql("REFRESH %s.%s_%s" % (params['raw_database'], subject, table_name))
+        schema_df = spark.sql(
+            "SELECT ' ' as TIMESTAMP, * FROM %s.%s_%s  limit 1" % (params['raw_database'], subject, table_name))
+        raw_schema_df = spark.sql("SELECT * FROM %s.%s_%s  limit 1" % (params['raw_database'], subject, table_name))
+        print("successfully executed")
+    except Exception as e:
+        print("Exception occured while running spark sql")
+        print(e)
+    raw_schema_df = spark.sql("SELECT * FROM %s.%s_%s  limit 1" % (params['raw_database'], subject, table_name))
+    raw_df = spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=raw_schema_df.schema)
+    initial_input_df = spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=schema_df.schema)
+    schema_df = spark.sql(
+        "SELECT 'I' as Op, ' ' as TIMESTAMP, * FROM %s.%s_%s limit 1" % (params['raw_database'], subject, table_name))
+    schema_df.printSchema()
+    inc_input_df = spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=schema_df.schema)
+    inc_input_list = []
+    for file in sorted(list_of_files.split(",")):
+        print("*******")
+        print(file)
+        if file.startswith('LOAD'):
+            initial_load = True
+            path = ''.join([prepare_path, file])
+            initial_input_df = initial_input_df.union(spark.read.parquet(path))
+        else:
+            path = ''.join([prepare_path, file])
+            print("Processing Incremental file")
+            print(path)
+            inc_input_list.append(path)
+    if len(inc_input_list)>0:
+            inc_input_df = inc_input_df.union(spark.read.parquet(*inc_input_list))
+    # Add Op column to initial load records
+    initial_input_df = initial_input_df.withColumn("Op", lit('L'))
+    cols = initial_input_df.columns
+    cols.remove('Op')
+    cols = ['Op'] + cols
+    initial_input_df = initial_input_df.select(cols)
+
+    if args['primary_keys'].strip() != '':
+        primaryKeys = args['primary_keys'].split(",")
+        primaryKeysWithPath = ['sortpath']+primaryKeys
+    else:
+        primaryKeys = cols[2]
+        primaryKeysWithPath = ['sortpath']+[primaryKeys]
+    inc_input_df = inc_input_df.withColumn('TIMESTAMP', F.to_timestamp("TIMESTAMP"))
+
+    # Order the incremental records based on input file name and the order of records in the file.
+    windowRow = Window.partitionBy(primaryKeys).orderBy("sortpath")
+    inc_input_df=inc_input_df.withColumn("sortpath", input_file_name())
+    new_schema = StructType(inc_input_df.schema.fields[:] + [StructField("index", LongType(), False)])
+    zipped_rdd = inc_input_df.rdd.zipWithIndex()
+    inc_input_df = (zipped_rdd.map(lambda ri: Row(*list(ri[0]) + [ri[1]])).toDF(new_schema))
+    new_schema = inc_input_df.schema
+    inc_input_df.write.parquet(path=stage_path, mode='overwrite')
+    new_inc_input_df = spark.createDataFrame(spark.sparkContext.emptyRDD(), schema=new_schema)
+    inc_input_df = new_inc_input_df.union(spark.read.parquet(stage_path))
+    # indexed=indexed.filter(col('global_property_id') == 3060954).filter(col('auction_id')==53910)
+    inc_input_df=inc_input_df.withColumn("rownum", row_number().over(windowRow))
+
+    window = Window.partitionBy(primaryKeysWithPath).orderBy(desc("index"))
+    inc_input_df = inc_input_df.withColumn('rnk', rank().over(window))
+
+    inc_input_df = inc_input_df.filter(col('rnk') == 1)
+    window = Window.partitionBy(primaryKeys).orderBy(desc("sortpath"), desc("rownum"))
+    inc_input_df = inc_input_df.withColumn('rnk2', rank().over(window)).where(col("rnk2")==1)
+    inc_input_df = inc_input_df.drop('sortpath', 'index', 'rnk', 'rnk2', 'rownum')
+
+
+    initial_input_df = initial_input_df.withColumn('TIMESTAMP', F.to_timestamp("TIMESTAMP"))
+    # Combine initial and inc dataframes
+    initial_inc_df = initial_input_df.union(inc_input_df)
+
+    # Derive Latest records from initial and inc records
+    udf4 = udf(derive_order, IntegerType())
+    initial_inc_df = initial_inc_df.withColumn('order', udf4(initial_inc_df.Op))
+    window = Window.partitionBy(primaryKeys).orderBy(desc("order"))
+    initial_inc_df = initial_inc_df.withColumn("rnk", F.rank().over(window))
+    initial_inc_df = initial_inc_df.where(col("rnk") == 1)
+    initial_inc_df = initial_inc_df.drop("order").drop("TIMESTAMP").drop("rnk")
+    if initial_load:
+        print("Initial Load of the dataset")
+        output = initial_inc_df.where(col("Op") != "D")
+        output = output.drop("Op").repartition(5)
+        output.write.parquet(path=raw_path, mode='overwrite')
+    else:
+        print("Consolidating Incremental and Raw files")
+        initial_inc_df = initial_inc_df.drop("order").drop("TIMESTAMP").drop("rnk")
+        prefix = ''.join([data_path, '/raw/', app_name, "/", subject, "/", table_name, "/"])
+        raw_df = raw_df.union(spark.read.parquet(raw_path))
+        raw_df = raw_df.withColumn("Op", lit('L'))
+        cols.remove('TIMESTAMP')
+        raw_df = raw_df.select(cols)
+        output = initial_inc_df.union(raw_df)
+        output = output.withColumn('order', udf4(output.Op))
+        print("Addition of order")
+        output.show(10)
+        windoworder = Window.partitionBy(primaryKeys).orderBy(desc("order"))
+        output = output.withColumn("rnk", F.rank().over(windoworder))
+        print("Addition of rnk")
+        output.show(10)
+        output = output.where(col("rnk") == 1).where(col("Op") != "D")
+        output.show(10)
+        output = output.drop("rnk").drop("order").drop("Op")
+        print("Writing to tmp")
+        output = output.repartition(5)
+        output.write.parquet(path=raw_path + 'tmp', mode='overwrite')
+        raw_files = s3.list_objects(Bucket=bucket_name, Prefix=prefix[1:])
+        print(prefix)
+        if 'Contents' in raw_files:
+            for element in raw_files.get('Contents'):
+                raw_key_file = element.get('Key')
+                print("Deleting raw file %s" % raw_key_file)
+                if len(raw_key_file) > len(prefix) and 'tmp' not in raw_key_file:
+                    s3.delete_object(Bucket=bucket_name, Key=raw_key_file)
+    spark.stop()
+    raw_tmp_files = s3.list_objects(Bucket=bucket_name, Prefix=prefix[1:] + 'tmp')
+    if 'Contents' in raw_tmp_files:
+        for element in raw_tmp_files.get('Contents'):
+            raw_key_file = element.get('Key')
+            copy_source = {'Bucket': bucket_name, 'Key': raw_key_file}
+            if len(raw_key_file) > len(prefix):
+                s3.copy(copy_source, bucket_name, ''.join(raw_key_file.split('/tmp')))
+            s3.delete_object(Bucket=bucket_name, Key=raw_key_file)
+    full_table_name = subject + '_' + table_name
+    for file_name in list_of_files.split(","):
+        item = {
+            'full_table_name': {'S': full_table_name},
+            'file_name': {'S': file_name},
+            'file_status': {'S': 'Complete'},
+            'updated_date': {'S': datetime.utcnow().isoformat()}
+        }
+        ddbconn.put_item(
+            TableName='DMSCDC_Controller',
+            Item=item)
+    tbl_cfg_file = subject + '.cfg'
+    tgt_path = '/'.join(['s3:/', bucket_name, 'data/clean', app_name, subject, table_name])
+    tbl_cfg = '/'.join(['s3:/', bucket_name, 'app', app_name, 'conf', tbl_cfg_file])
+    job_max_cap = int(args['job_max_cap'])
+    response = glue_client.start_job_run(
+        JobName='mrph_framework',
+        Arguments={
+            '--SUBJECT_NAME': subject,
+            '--TABLE_NAME': table_name,
+            '--CONFIG_FILE': tbl_cfg_file,
+            '--TARGET_PATH': tgt_path,
+            '--extra-files': tbl_cfg},
+        MaxCapacity=job_max_cap)
+
+
+if __name__ == '__main__':
+    main()
         
 
